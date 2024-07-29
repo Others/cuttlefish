@@ -23,10 +23,10 @@ from stopwatch import Stopwatch
 
 class CuttlefishNetwork(nn.Module):
 
+    INPUT_LAYER_OUTPUT_SIZE = 512
     # This used to be 512 as well
     HIDDEN_LAYER_SIZE = 128
-    INPUT_LAYER_OUTPUT_SIZE = 512
-    OUTPUT_LAYER_INPUT_SIZE = HIDDEN_LAYER_SIZE
+    OUTPUT_LAYER_INPUT_SIZE = HIDDEN_LAYER_SIZE // 2
 
     def __init__(self):
         super(CuttlefishNetwork, self).__init__()
@@ -89,7 +89,7 @@ class CuttlefishNetwork(nn.Module):
         return self.output_layer(x)
 
 
-def evaluate_model_with_metrics(model, test_loader):
+def evaluate_model_with_metrics(model, test_loader, l):
     model.eval()  # Set the model to evaluation mode
     total_loss = 0.0
     correct = 0
@@ -98,6 +98,9 @@ def evaluate_model_with_metrics(model, test_loader):
     all_predictions = []
 
     criterion = nn.BCEWithLogitsLoss()  # Using BCEWithLogitsLoss for evaluation
+
+    update_stopwatch = Stopwatch()
+    update_stopwatch.start()
 
     print_with_timestamp("Starting model evaluation...")
     with torch.no_grad():  # Disable gradient computation
@@ -117,6 +120,12 @@ def evaluate_model_with_metrics(model, test_loader):
 
             all_targets.extend(targets.cpu().numpy())
             all_predictions.extend(torch.sigmoid(outputs).cpu().numpy())
+
+            if update_stopwatch.has_minute_elapsed():
+                print_with_timestamp(
+                    f"Update: {(total / l) * 100:.2f}% done with evaluation"
+                )
+                update_stopwatch.reset()
 
     print_with_timestamp("Finished running model for validation. Now calculating...")
     average_loss = total_loss / total
@@ -164,6 +173,7 @@ def main():
         # 10_000
         # 5_000_000
         36_000_000,
+        # 10_000_000
     )
 
     # Initialize the model
@@ -238,7 +248,7 @@ def main():
 
         print_with_timestamp(f"Doing evaluation for epoch {epoch + 1}")
         model.eval()
-        validation_metrics = evaluate_model_with_metrics(model, validation_loader)
+        validation_metrics = evaluate_model_with_metrics(model, validation_loader, validation_set.cap)
         val_loss = validation_metrics["loss"]
 
         print_with_timestamp(f"Epoch [{epoch + 1}/{num_epochs}]")
@@ -256,7 +266,7 @@ def main():
                 break
 
     print_with_timestamp("DOING FINAL EVALUATION ON TEST SET")
-    metrics = evaluate_model_with_metrics(model, test_loader)
+    metrics = evaluate_model_with_metrics(model, test_loader, test_set.cap)
     print_with_timestamp(f"METRICS {metrics}")
     print_pretty_table("Test Metrics", metrics)
 

@@ -29,7 +29,7 @@ class Cuttlefish:
             current_position, True
         )
         best_move = self.stockfish_evaluator.get_best_move(original_position)
-        # print(original_position, "\n", original_position_evaluation)
+        print(f"Cuttlefish Evaluation: {original_position_evaluation.value}")
 
         # Check all evaluations
         moves = list(current_position.legal_moves)
@@ -55,10 +55,14 @@ class Cuttlefish:
 
         variance = max(humanness) - min(humanness)
         if variance < 0.01:
-            print(
-                "The variance between moves is too low to provide a reasonable choice. Playing approximate best move instead"
-            )
-            return current_position.parse_san(best_move)
+            if variance > 0:
+                print("The variance between moves is negligible, playing the best option rather than using probablity.")
+                return max(evaluations, key=lambda x: x.humanness).move
+            else:
+                print(
+                    "The variance between moves is zero. Playing approximate best move instead"
+                )
+                return current_position.parse_san(best_move)
 
         # Pick one
         n_evaluations = len(evaluations)
@@ -163,8 +167,8 @@ def print_board(board):
 
 def main():
     cuttlefish = Cuttlefish("/usr/local/bin/stockfish", "best_model.pth")
-    # board = Board("8/2p5/3k4/3r4/8/8/5PP1/6K1 w - - 0 1")
-    board = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    board = Board("8/2p5/3k4/3r4/8/8/5PP1/6K1 w - - 0 1")
+    # board = Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
 
     while not board.is_checkmate():
         print_board(board)
@@ -181,6 +185,8 @@ def main():
                 human_input = input()
                 human_move = Move.from_uci(human_input)
             except InvalidMoveError:
+                print("Illegal Move!")
+            except AssertionError:
                 print("Illegal Move!")
         board.push(human_move)
 
