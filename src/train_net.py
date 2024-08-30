@@ -1,273 +1,205 @@
-from typing import List
+from datetime import timedelta
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from prettytable import PrettyTable
-from sklearn.metrics import (
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 from torch.utils.data import DataLoader
 
-from data_loader import create_lazy_loaders, custom_collate
-from pgn_to_tensor import MoveTensor
-from print_with_timestamp import print_with_timestamp
-from stopwatch import Stopwatch
+from dataloader.new_loader import CircularDataset, DirectFromPgnLoader
+from evaluate_model import evaluate_model_with_metrics
+from nets.net_2048_focus import Collator, CuttlefishNetwork
+from utils.print_extra import print_pretty_table, print_with_timestamp
+from utils.stopwatch import Stopwatch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class CuttlefishNetwork(nn.Module):
+def train_with_data(data, labels, model, optimizer, criterion):
+    # print_with_timestamp(f"{len(inputs)} inputs. {len(targets)} targets")
 
-    INPUT_LAYER_OUTPUT_SIZE = 512
-    # This used to be 512 as well
-    HIDDEN_LAYER_SIZE = 128
-    OUTPUT_LAYER_INPUT_SIZE = HIDDEN_LAYER_SIZE // 2
+    optimizer.zero_grad()  # Zero the parameter gradients
 
-    def __init__(self):
-        super(CuttlefishNetwork, self).__init__()
+    outputs = model(data)  # Forward pass
+    loss = criterion(outputs, labels)  # Compute the loss
 
-        self.input_layer = nn.LazyLinear(self.INPUT_LAYER_OUTPUT_SIZE)
+    loss.backward()  # Backward pass
+    optimizer.step()  # Optimize the weights
 
-        self.hidden_layer_1 = nn.Linear(
-            self.INPUT_LAYER_OUTPUT_SIZE, self.HIDDEN_LAYER_SIZE
-        )
-
-        self.hidden_layer_2 = nn.Linear(
-            self.HIDDEN_LAYER_SIZE, self.OUTPUT_LAYER_INPUT_SIZE
-        )
-
-        self.output_layer = nn.Linear(self.OUTPUT_LAYER_INPUT_SIZE, 1)
-        # pytorch_total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # print_with_timestamp(f"N parameters = {pytorch_total_params}, estimated amount of data needed = {pytorch_total_params * 10}")
-
-    def forward(self, move_tensor_list: List[MoveTensor]):
-        friendly_pieces_before = torch.stack(
-            [move.friendlyPiecesBefore.to(torch.float) for move in move_tensor_list]
-        )
-        unfriendly_pieces_before = torch.stack(
-            [move.unfriendlyPiecesBefore.to(torch.float) for move in move_tensor_list]
-        )
-        friendly_pieces_after = torch.stack(
-            [move.friendlyPiecesAfter.to(torch.float) for move in move_tensor_list]
-        )
-        unfriendly_pieces_after = torch.stack(
-            [move.unfriendlyPiecesAfter.to(torch.float) for move in move_tensor_list]
-        )
-        evaluation_before = torch.stack(
-            [move.evaluationBefore for move in move_tensor_list]
-        )
-        evaluation_after = torch.stack(
-            [move.evaluationAfter for move in move_tensor_list]
-        )
-
-        x = torch.cat(
-            (
-                friendly_pieces_before,
-                unfriendly_pieces_before,
-                friendly_pieces_after,
-                unfriendly_pieces_after,
-                evaluation_before,
-                evaluation_after,
-            ),
-            dim=1,
-        )
-
-        x = self.input_layer(x)
-        x = F.leaky_relu(x)
-
-        x = self.hidden_layer_1(x)
-        x = F.leaky_relu(x)
-
-        x = self.hidden_layer_2(x)
-        x = F.leaky_relu(x)
-
-        return self.output_layer(x)
+    return loss
 
 
-def evaluate_model_with_metrics(model, test_loader, l):
-    model.eval()  # Set the model to evaluation mode
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    all_targets = []
-    all_predictions = []
+def run_epoch(
+    epoch,
+    model,
+    train_loader,
+    train_time,
+    optimizer,
+    criterion,
+    update_stopwatch,
+    overall_stopwatch,
+):
+    model.train()  # Set the model to training mode
+    model.to(device)
+    update_stopwatch.reset()  # Reset the timer to avoid pointless updates
+    overall_stopwatch.reset()
+    running_loss = 0.0
+    running_loss_n = 0
 
-    criterion = nn.BCEWithLogitsLoss()  # Using BCEWithLogitsLoss for evaluation
+    for entry in train_loader:
+        data = entry.data.to(device)
+        labels = entry.labels.to(device)
 
-    update_stopwatch = Stopwatch()
-    update_stopwatch.start()
+        loss = train_with_data(data, labels, model, optimizer, criterion)
 
-    print_with_timestamp("Starting model evaluation...")
-    with torch.no_grad():  # Disable gradient computation
-        for entry in test_loader:
-            inputs = entry["data"]
-            targets = entry["labels"]
+        if epoch > 1 and running_loss == 0:
+            pytorch_total_params = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            print_with_timestamp(
+                f"N parameters = {pytorch_total_params:,}, estimated amount of data needed = {pytorch_total_params * 10:,}"
+            )
 
-            outputs = model(inputs)  # Forward pass
-            loss = criterion(outputs, targets.to(torch.float))  # Compute the loss
-            # print_with_timestamp(inputs, targets, outputs, loss)
-            total_loss += loss.item() * len(inputs)
+        running_loss += loss.item() * len(labels)
+        running_loss_n += len(labels)
 
-            # Apply sigmoid to outputs and round to get binary predictions
-            predicted = torch.sigmoid(outputs).round()
-            correct += (predicted == targets).sum().item()
-            total += len(targets)
+        if update_stopwatch.has_minute_elapsed():
+            print_with_timestamp(
+                f"Update: {overall_stopwatch.percentage_elapsed(train_time)} done with epoch {epoch + 1}"
+            )
+            update_stopwatch.reset()
 
-            all_targets.extend(targets.cpu().numpy())
-            all_predictions.extend(torch.sigmoid(outputs).cpu().numpy())
+            if overall_stopwatch.has_delta_elapsed(train_time):
+                break
 
-            if update_stopwatch.has_minute_elapsed():
-                print_with_timestamp(
-                    f"Update: {(total / l) * 100:.2f}% done with evaluation"
-                )
-                update_stopwatch.reset()
-
-    print_with_timestamp("Finished running model for validation. Now calculating...")
-    average_loss = total_loss / total
-    accuracy = correct / total
-    all_targets = np.array(all_targets)
-    all_predictions = np.array(all_predictions)
-
-    # Calculate additional metrics
-    precision = precision_score(all_targets, all_predictions.round())
-    recall = recall_score(all_targets, all_predictions.round())
-    f1 = f1_score(all_targets, all_predictions.round())
-    roc_auc = roc_auc_score(all_targets, all_predictions)
-    conf_matrix = confusion_matrix(all_targets, all_predictions.round())
-
-    print_with_timestamp("Finalized evaluation calculations!")
-    return {
-        "loss": average_loss,
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1,
-        "roc_auc": roc_auc,
-        "confusion_matrix": conf_matrix,
-    }
-
-
-def print_pretty_table(title, d):
-    table = PrettyTable()
-    table.field_names = ["Metric", "Value"]
-    table.float_format = ".5"
-    # Add rows to the table
-    for key, value in d.items():
-        table.add_row([key, value])
-
-    print_with_timestamp(f"{title}:")
-    print(table)
+    return running_loss, running_loss_n
 
 
 def main():
     # Create a DataLoader for the training data
-    print_with_timestamp("DATASET LOADING")
+    print_with_timestamp("Dataset loading...")
+    batch_size = 64
 
-    train_set, validation_set, test_set = create_lazy_loaders(
-        "data3",
-        # 10_000
-        # 5_000_000
-        36_000_000,
-        # 10_000_000
+    # Setup the collator
+    collator = Collator()
+
+    # FIXME: Try a bigger batch size
+    train_circle = CircularDataset(
+        DirectFromPgnLoader(
+            [
+                "data/lichess_db_standard_rated_2024-05.pgn.zst",
+                "data/lichess_db_standard_rated_2024-04.pgn.zst",
+                "data/lichess_db_standard_rated_2024-03.pgn.zst",
+            ]
+        )
     )
+    train_loader = DataLoader(
+        train_circle,
+        num_workers=2,
+        batch_size=batch_size,
+        prefetch_factor=3,
+        shuffle=False,
+        collate_fn=collator.custom_collate,
+    )
+    train_time = timedelta(minutes=30)
+
+    validation_loader = DataLoader(
+        DirectFromPgnLoader(
+            [
+                "data/lichess_db_standard_rated_2024-06.pgn.zst",
+                "data/lichess_db_standard_rated_2024-02.pgn.zst",
+            ]
+        ),
+        num_workers=2,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collator.custom_collate,
+    )
+    validation_time = train_time * 0.5
+
+    test_loader = DataLoader(
+        DirectFromPgnLoader(
+            [
+                "data/lichess_db_standard_rated_2024-07.pgn.zst",
+                "data/lichess_db_standard_rated_2024-01.pgn.zst",
+            ]
+        ),
+        num_workers=2,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collator.custom_collate,
+    )
+    test_time = train_time * 2
 
     # Initialize the model
-    print_with_timestamp("NETWORK LOADING")
+    print_with_timestamp("Network loading...")
     model = CuttlefishNetwork()
-    # FIXME: Try a bigger batch size
-    train_loader = DataLoader(
-        train_set, batch_size=64, shuffle=False, collate_fn=custom_collate
-    )
-    validation_loader = DataLoader(
-        validation_set, batch_size=64, shuffle=False, collate_fn=custom_collate
-    )
-    test_loader = DataLoader(
-        test_set, batch_size=64, shuffle=False, collate_fn=custom_collate
-    )
-    print_with_timestamp("NETWORK READY")
+    print_with_timestamp(f"Device set to: {device}")
 
-    print_with_timestamp("OPTIMIZER LOADING")
+    print_with_timestamp("Optimizer loading...")
     # Define the loss function
     criterion = nn.BCEWithLogitsLoss()  # Mean Squared Error Loss
-    # Define the optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    print_with_timestamp("OPTIMIZER READY")
+    # Define the optimizer (this lr is the default BTW)
+    optimizer = optim.Adamax(model.parameters(), lr=2e-3, weight_decay=1e-5)
 
+    print_with_timestamp("Beginning training...")
+    overall_stopwatch = Stopwatch()
+    overall_stopwatch.start()
     update_stopwatch = Stopwatch()
     update_stopwatch.start()
 
     # Training loop
-    num_epochs = 50  # Number of epochs
-    early_stopping_patience = 10
+    num_epochs = 250  # Number of epochs
+    early_stopping_patience = num_epochs / 2
     best_val_loss = float("inf")
     patience_counter = 0
 
     for epoch in range(num_epochs):
-        print_with_timestamp(f"STARTING EPOCH {epoch + 1}")
-        model.train()  # Set the model to training mode
-        train_set.shuffle()  # Shuffle the training set manually
-        update_stopwatch.reset()  # Reset the timer to avoid pointless updates
-        running_loss = 0.0
-        running_loss_n = 0
 
-        for entry in train_loader:
-            inputs = entry["data"]
-            targets = entry["labels"]
+        print_with_timestamp(f"Starting training for Epoch [{epoch + 1}/{num_epochs}]")
 
-            # print_with_timestamp(f"{len(inputs)} inputs. {len(targets)} targets")
+        (loss, loss_n) = run_epoch(
+            epoch,
+            model,
+            train_loader,
+            train_time,
+            optimizer,
+            criterion,
+            update_stopwatch,
+            overall_stopwatch,
+        )
 
-            optimizer.zero_grad()  # Zero the parameter gradients
-
-            outputs = model(inputs)  # Forward pass
-            loss = criterion(outputs, targets)  # Compute the loss
-
-            loss.backward()  # Backward pass
-            optimizer.step()  # Optimize the weights
-
-            if running_loss == 0:
-                pytorch_total_params = sum(
-                    p.numel() for p in model.parameters() if p.requires_grad
-                )
-                print_with_timestamp(
-                    f"N parameters = {pytorch_total_params:,}, estimated amount of data needed = {pytorch_total_params * 10:,}"
-                )
-            running_loss += loss.item() * len(inputs)
-            running_loss_n += len(inputs)
-            # print_with_timestamp(f"Loss: {loss.item():.4f}, Len {len(inputs)}, Running Loss: {running_loss:.4f}, Running Loss N: {running_loss_n:.4f}")
-
-            if update_stopwatch.has_minute_elapsed():
-                print_with_timestamp(
-                    f"Update: {(running_loss_n / train_set.cap) * 100:.2f}% done with epoch {epoch + 1}"
-                )
-                update_stopwatch.reset()
-
-        print_with_timestamp(f"Doing evaluation for epoch {epoch + 1}")
+        print_with_timestamp(f"Trained on {loss_n:,} samples")
+        print_with_timestamp(f"Doing evaluation for Epoch [{epoch + 1}/{num_epochs}]")
         model.eval()
-        validation_metrics = evaluate_model_with_metrics(model, validation_loader, validation_set.cap)
+        validation_metrics = evaluate_model_with_metrics(
+            model, validation_loader, validation_time
+        )
         val_loss = validation_metrics["loss"]
 
-        print_with_timestamp(f"Epoch [{epoch + 1}/{num_epochs}]")
-        print_with_timestamp(f"Training Loss: {running_loss / running_loss_n:.6f}")
+        print_with_timestamp(f"Training Loss: {loss / loss_n:.6f}")
         print_pretty_table("Validation Data", validation_metrics)
 
+        print_with_timestamp(f"Finished Epoch [{epoch + 1}/{num_epochs}]")
+
         if val_loss < best_val_loss:
+            print_with_timestamp(
+                f"New best model! Validation loss of {val_loss:.4f} beat the record of {best_val_loss:.4f}"
+            )
             best_val_loss = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), "best_model.pth")  # Save the best model
         else:
             patience_counter += 1
             if patience_counter >= early_stopping_patience:
-                print_with_timestamp("EARLY STOPPING TRIGGERED")
+                print_with_timestamp(
+                    f"Stopping early due to failure to learn for {early_stopping_patience} epochs..."
+                )
                 break
+        print()
 
-    print_with_timestamp("DOING FINAL EVALUATION ON TEST SET")
-    metrics = evaluate_model_with_metrics(model, test_loader, test_set.cap)
-    print_with_timestamp(f"METRICS {metrics}")
+    print_with_timestamp("Doing final evaluation on test set...")
+    metrics = evaluate_model_with_metrics(model, test_loader, test_time)
+    print_with_timestamp(f"Raw metrics {metrics}")
     print_pretty_table("Test Metrics", metrics)
 
 
